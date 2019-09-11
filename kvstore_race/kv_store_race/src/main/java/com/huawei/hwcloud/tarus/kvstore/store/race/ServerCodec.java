@@ -60,7 +60,7 @@ public class ServerCodec extends ProtocolCodec {
             }
             src.skipRead(3);
             long key = src.readLongLE();
-            store.set(key, src);
+            store.write(key, src);
             send_buf.writeByte((byte) header);
             send_buf.retain();
             ch.writeAndFlush(send_buf);

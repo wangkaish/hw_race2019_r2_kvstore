@@ -83,6 +83,7 @@ public class KVStoreServer implements KVStoreCheck {
             log("bind success");
         } catch (Exception e) {
             printException(e);
+            throw new RuntimeException(e);
         }
         this.context = context;
         return 0.1;

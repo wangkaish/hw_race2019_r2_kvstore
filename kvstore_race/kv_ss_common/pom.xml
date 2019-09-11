@@ -16,10 +16,5 @@
             <groupId>com.huawei.hwcloud.tarus.kvstore</groupId>
             <artifactId>kvstore_common</artifactId>
         </dependency>
-        <dependency>
-            <groupId>com.firenio</groupId>
-            <artifactId>firenio-all</artifactId>
-            <version>1.3.0-SNAPSHOT</version>
-        </dependency>
     </dependencies>
 </project>

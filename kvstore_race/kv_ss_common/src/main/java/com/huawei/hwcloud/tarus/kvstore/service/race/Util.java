@@ -30,7 +30,6 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.List;
 
-import moe.cnkirito.kdio.DirectRandomAccessFile;
 import sun.nio.ch.DirectBuffer;
 
 import com.firenio.buffer.ByteBuf;
@@ -125,15 +124,6 @@ public class Util {
             FileChannel channel = FileChannel.open(file.toPath(), options);
             channel.position(channel.size());
             return channel;
-        } catch (IOException e) {
-            printException(e);
-            throw new RuntimeException(e);
-        }
-    }
-
-    public static DirectRandomAccessFile openDioR(File file) {
-        try {
-            return new DirectRandomAccessFile(file, "r");
         } catch (IOException e) {
             printException(e);
             throw new RuntimeException(e);

@@ -9,14 +9,11 @@ import java.nio.channels.FileChannel;
 import java.nio.file.OpenOption;
 import java.nio.file.StandardOpenOption;
 
-import moe.cnkirito.kdio.DirectIOLib;
-import moe.cnkirito.kdio.DirectIOUtils;
-import moe.cnkirito.kdio.DirectRandomAccessFile;
-
 import com.firenio.buffer.ByteBuf;
 import com.firenio.common.Unsafe;
 import com.firenio.common.Util;
 import com.firenio.component.Channel;
+import com.firenio.component.Native;
 import com.huawei.hwcloud.tarus.kvstore.exception.KVSException;
 import com.huawei.hwcloud.tarus.kvstore.service.race.LongIntMap;
 
@@ -25,15 +22,12 @@ import static com.huawei.hwcloud.tarus.kvstore.service.race.Util.*;
 
 public class EngineKVStoreRace {
 
-    static final byte         UN_KEY        = -1;
     static final int          TEMP_FILE_LEN = ONLINE ? 256 : 3;
     static final OpenOption[] FC_OPS        = new OpenOption[]{StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE};
 
-    FileChannel      data_channel;
     FileChannel      index_channel;
     FileChannel      temp_channel;
-    DioReader        data_reader;
-    DioReader        data_writer;
+    DFileChannel     data_channel;
     MappedByteBuffer index_buf;
     MappedByteBuffer temp_buf;
     long             temp_buf_addr;
@@ -41,17 +35,7 @@ public class EngineKVStoreRace {
     boolean          p_init          = false;
     int              inst_id;
 
-    static void print_index_map(LongIntMap map) {
-        for (map.scan(); map.hasNext(); ) {
-            log("key: " + map.key() + ", pos: " + map.value());
-        }
-    }
-
-    static ByteBuffer new_read_buf() {
-        return ByteBuffer.allocate(VALUE_LEN);
-    }
-
-    public boolean init(final int inst_id) throws KVSException {
+    public boolean init(final int inst_id) {
         if (p_init) {
             log("already init");
             return true;
@@ -68,13 +52,10 @@ public class EngineKVStoreRace {
         File data_file  = new File(root_path + inst_id + "_data");
         File index_file = new File(root_path + inst_id + "_index");
         File temp_file  = new File(root_path + inst_id + "_temp");
-        this.data_channel = open(data_file, FC_OPS);
         this.index_channel = open(index_file, FC_OPS);
         this.temp_channel = open(temp_file, FC_OPS);
-        this.data_reader = new DioReader(data_file, "r");
-        this.data_writer = new DioReader(data_file, "rw");
+        this.data_channel = new DFileChannel(data_file);
         FileChannel index_channel = this.index_channel;
-        FileChannel data_channel  = this.data_channel;
         log("d_size: " + data_file.length() + ", i_size: " + index_file.length() + ", t_size: " + temp_file.length());
         try {
             long file_size = index_channel.size();
@@ -100,15 +81,11 @@ public class EngineKVStoreRace {
                     log("index size: " + index_size);
                     index_buf.position((int) (index_pos));
                     long expect_pos  = 1L * index_size * VALUE_LEN;
-                    long recover_len = expect_pos - data_channel.size();
+                    int  recover_len = (int) (expect_pos - data_channel.file_size());
                     if (recover_len > 0) {
-                        ByteBuffer temp = temp_buf.duplicate();
-                        temp.limit((int) recover_len);
-                        data_channel.write(temp);
-                    } else {
-                        data_channel.position(expect_pos);
+                        data_channel.write(temp_buf_addr, recover_len);
                     }
-                    this.data_writer.set_write_pos(expect_pos);
+                    data_channel.set_write_pos(expect_pos);
                 } else {
                     index_buf.position(KEY_LEN);
                 }
@@ -123,27 +100,19 @@ public class EngineKVStoreRace {
         return true;
     }
 
-    public void set(final long key, final ByteBuf value) throws KVSException {
-        MappedByteBuffer index_buf    = this.index_buf;
-        MappedByteBuffer temp_buf     = this.temp_buf;
-        int              temp_buf_pos = temp_buf.position();
-        long             src_addr     = value.address() + value.absReadIndex();
-        long             dst_addr     = temp_buf_addr + temp_buf_pos;
+    public void write(final long key, final ByteBuf value) {
+        ByteBuffer index_buf    = this.index_buf;
+        ByteBuffer temp_buf     = this.temp_buf;
+        int        temp_buf_pos = temp_buf.position();
+        long       src_addr     = value.address() + value.absReadIndex();
+        long       dst_addr     = temp_buf_addr + temp_buf_pos;
         Unsafe.copyMemory(src_addr, dst_addr, VALUE_LEN);
         value.skipRead(VALUE_LEN);
         temp_buf.position(temp_buf_pos + VALUE_LEN);
         if (!temp_buf.hasRemaining()) {
-            try {
-                ByteBuffer temp = temp_buf.duplicate();
-                temp.flip();
-                long st = System.nanoTime();
-                data_writer.write(temp);
-                long past = System.nanoTime() - st;
-                data_write_cost += past;
-            } catch (IOException e) {
-                printException(e);
-                throw new RuntimeException(e);
-            }
+            long st = System.nanoTime();
+            data_channel.write(temp_buf_addr, TEMP_FILE_LEN * VALUE_LEN);
+            data_write_cost += System.nanoTime() - st;
             temp_buf.position(0);
         }
         index_buf.putLong(key);
@@ -152,11 +121,7 @@ public class EngineKVStoreRace {
 
     public void read(Channel ch, long pos, ByteBuf val) {
         flush();
-        try {
-            data_reader.native_read(ch, val, pos, READ_BLOCK_SIZE);
-        } catch (IOException e) {
-            printException(e);
-        }
+        data_channel.read(ch, val, pos, READ_BLOCK_SIZE);
         if (DEBUG && inst_id == 0) {
             log("read data: " + pos);
         }
@@ -169,51 +134,38 @@ public class EngineKVStoreRace {
         }
         p_init = false;
         log("close partition: " + inst_id + ", write cost: " + (data_write_cost / 1000_000));
-        release_mapped_buf(this.index_buf);
-        release_mapped_buf(this.temp_buf);
-        Util.close(data_channel);
+        release_mapped_buf(index_buf);
+        release_mapped_buf(temp_buf);
         Util.close(index_channel);
-        data_write_cost = 0;
-        temp_buf = null;
-        index_buf = null;
+        Util.close(data_channel);
     }
 
     public void flush() {
         ByteBuffer temp_buf = this.temp_buf;
         if (temp_buf.position() > 0) {
             log("flush partition: " + inst_id);
-            ByteBuffer temp = temp_buf.duplicate();
-            temp.flip();
-            try {
-                this.data_writer.write(temp);
-            } catch (IOException e) {
-                printException(e);
-            }
+            this.data_channel.write(temp_buf_addr, temp_buf.position());
             temp_buf.position(0);
         }
     }
 
-    static final class DioReader implements Closeable {
+    static final class DFileChannel implements Closeable {
 
-        static final DirectIOLib DIRECT_IO_LIB = DirectIOLib.getLibForPath("./temp/test_direct");
-
-        final ByteBuffer             read_buf      = DirectIOUtils.allocateForDirectIO(DIRECT_IO_LIB, READ_BLOCK_SIZE);
-        final long                   read_buf_addr = Unsafe.address(read_buf);
-        final DirectRandomAccessFile dio;
+        final long    read_buf_addr = Native.posix_memalign_allocate(READ_BLOCK_SIZE, 1024 * 4);
+        final ByteBuf read_buf      = ByteBuf.wrap(read_buf_addr, READ_BLOCK_SIZE);
+        final int     fd;
 
         long write_pos;
-        long start_pos = -1;
-        long end_pos   = -1;
 
-        DioReader(File file, String mode) {
-            this.dio = open_dio(file, mode);
+        DFileChannel(File file) {
+            this.fd = Native.open(file.getAbsolutePath(), Native.O_RDWR | Native.O_CREAT | Native.O_DIRECT, 0755);
+            this.write_pos = Native.file_length(fd);
         }
 
-        void native_read(Channel ch, ByteBuf dst, long pos, int len) throws IOException {
-            ByteBuffer read_buf = this.read_buf;
-            int        read     = dio.read(read_buf, pos);
-            read_buf.flip();
-            ByteBuf data = ByteBuf.wrap(read_buf);
+        void read(Channel ch, ByteBuf dst, long pos, int len) {
+            Native.lseek(fd, pos, Native.SEEK_SET);
+            ByteBuf data = this.read_buf;
+            int     read = Native.read(fd, read_buf_addr, READ_BLOCK_SIZE);
             data.readIndex(0);
             data.writeIndex(read);
             data.retain();
@@ -224,45 +176,26 @@ public class EngineKVStoreRace {
             ch.writeAndFlush(data);
         }
 
-        void full_read(DirectRandomAccessFile dio, ByteBuffer read_buf, long read_pos) throws IOException {
-            for (; read_buf.hasRemaining(); ) {
-                int len = dio.read(read_buf, read_pos);
-                if (len == -1) {
-                    break;
-                }
-                read_pos += len;
-            }
-        }
-
-        void write(byte[] data, long pos) throws IOException {
-            read_buf.clear();
-            read_buf.put(data);
-            read_buf.flip();
-            dio.write(read_buf, pos);
-        }
-
-        void write(ByteBuffer buf) throws IOException {
-            int len = dio.write(buf, write_pos);
-            write_pos += len;
+        void write(long address, int len) {
+            int write_len = Native.write(fd, address, len);
+            write_pos += write_len;
         }
 
         void set_write_pos(long pos) {
             this.write_pos = pos;
+            Native.lseek(fd, pos, Native.SEEK_SET);
         }
 
-        DirectRandomAccessFile open_dio(File file, String mode) {
-            try {
-                return new DirectRandomAccessFile(file, mode);
-            } catch (IOException e) {
-                printException(e);
-                throw new RuntimeException(e);
-            }
+        long file_size() {
+            return write_pos;
         }
 
         @Override
         public void close() {
             Unsafe.free(read_buf_addr);
+            Native.close(fd);
         }
+
     }
 
 }
